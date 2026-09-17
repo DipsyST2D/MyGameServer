@@ -6,7 +6,7 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 const GAME_PORT = 7777;
 
 const lobbies = new Map();
@@ -128,7 +128,7 @@ wss.on("connection", (socket) => {
     });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
     console.log("================================");
     console.log("Lobby server started!");
     console.log("Lobby port:", PORT);
