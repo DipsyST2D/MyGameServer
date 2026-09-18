@@ -7,7 +7,6 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 3000;
-const GAME_PORT = 7777;
 
 const lobbies = new Map();
 
@@ -26,7 +25,8 @@ function sendLobbyList() {
             name: lobby.name,
             map: lobby.map,
             players: lobby.players,
-            max_players: lobby.max_players
+            max_players: lobby.max_players,
+            room_id: lobby.room_id
         });
     }
 
@@ -72,12 +72,17 @@ wss.on("connection", (socket) => {
                 map: message.map,
                 players: 1,
                 max_players: 8,
-                game_port: GAME_PORT
+                room_id: ""
             };
 
             lobbies.set(lobbyId, lobby);
 
-            console.log("Created:", lobby.name, "|", lobby.map);
+            console.log(
+                "Created:",
+                lobby.name,
+                "|",
+                lobby.map
+            );
 
             socket.send(JSON.stringify({
                 type: "lobby_created",
@@ -88,8 +93,37 @@ wss.on("connection", (socket) => {
             sendLobbyList();
         }
 
+        if (message.type === "set_room_id") {
+            const lobbyId = Number(message.lobby_id);
+            const roomId = String(message.room_id);
+
+            const lobby = lobbies.get(lobbyId);
+
+            if (!lobby) {
+                socket.send(JSON.stringify({
+                    type: "error",
+                    message: "Lobby does not exist."
+                }));
+
+                return;
+            }
+
+            lobby.room_id = roomId;
+
+            console.log(
+                "NodeTunnel room assigned:",
+                lobby.name,
+                "|",
+                roomId
+            );
+
+            sendLobbyList();
+        }
+
         if (message.type === "join_lobby") {
-            const lobby = lobbies.get(Number(message.lobby_id));
+            const lobbyId = Number(message.lobby_id);
+
+            const lobby = lobbies.get(lobbyId);
 
             if (!lobby) {
                 socket.send(JSON.stringify({
@@ -109,9 +143,23 @@ wss.on("connection", (socket) => {
                 return;
             }
 
+            if (!lobby.room_id) {
+                socket.send(JSON.stringify({
+                    type: "error",
+                    message: "Game room is not ready yet."
+                }));
+
+                return;
+            }
+
             lobby.players += 1;
 
-            console.log("Player joined:", lobby.name);
+            console.log(
+                "Player joined:",
+                lobby.name,
+                "| NodeTunnel room:",
+                lobby.room_id
+            );
 
             socket.send(JSON.stringify({
                 type: "lobby_joined",
@@ -132,6 +180,5 @@ server.listen(PORT, "0.0.0.0", () => {
     console.log("================================");
     console.log("Lobby server started!");
     console.log("Lobby port:", PORT);
-    console.log("Game port:", GAME_PORT);
     console.log("================================");
 });
