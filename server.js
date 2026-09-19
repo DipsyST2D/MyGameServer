@@ -11,45 +11,60 @@ const PORT = process.env.PORT || 3000;
 const lobbies = new Map();
 
 let nextLobbyId = 1;
+let nextPlayerId = 1;
 
 app.get("/", (req, res) => {
-    res.send("Lobby server is running!");
+    res.send("Multiplayer server is running!");
 });
 
-function sendLobbyList() {
-    const lobbyList = [];
+function sendTo(socket, data) {
+    if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(data));
+    }
+}
+
+function broadcastLobbyList() {
+    const lobbiesArray = [];
 
     for (const lobby of lobbies.values()) {
-        lobbyList.push({
+        lobbiesArray.push({
             id: lobby.id,
             name: lobby.name,
             map: lobby.map,
-            players: lobby.players,
-            max_players: lobby.max_players,
-            room_id: lobby.room_id
+            players: lobby.players.size,
+            max_players: lobby.max_players
         });
     }
 
-    const message = JSON.stringify({
+    const message = {
         type: "lobby_list",
-        lobbies: lobbyList
-    });
+        lobbies: lobbiesArray
+    };
 
     for (const client of wss.clients) {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(message);
+        sendTo(client, message);
+    }
+}
+
+function broadcastToGame(lobby, data, exceptSocket = null) {
+    for (const player of lobby.gamePlayers.values()) {
+        if (player.socket !== exceptSocket) {
+            sendTo(player.socket, data);
         }
     }
 }
 
 wss.on("connection", (socket) => {
-    console.log("Player connected");
+    console.log("Client connected");
 
-    socket.send(JSON.stringify({
+    socket.lobbyId = null;
+    socket.playerId = null;
+
+    sendTo(socket, {
         type: "connected"
-    }));
+    });
 
-    sendLobbyList();
+    broadcastLobbyList();
 
     socket.on("message", (data) => {
         let message;
@@ -57,25 +72,27 @@ wss.on("connection", (socket) => {
         try {
             message = JSON.parse(data.toString());
         } catch {
-            console.log("Received invalid JSON");
+            console.log("Invalid JSON received");
             return;
         }
 
         if (message.type === "create_lobby") {
-            const lobbyId = nextLobbyId;
-
-            nextLobbyId += 1;
+            const lobbyId = nextLobbyId++;
 
             const lobby = {
                 id: lobbyId,
                 name: "Room " + lobbyId,
-                map: message.map,
-                players: 1,
+                map: String(message.map),
                 max_players: 8,
-                room_id: ""
+                players: new Map(),
+                gamePlayers: new Map()
             };
 
             lobbies.set(lobbyId, lobby);
+
+            socket.lobbyId = lobbyId;
+
+            lobby.players.set(socket, true);
 
             console.log(
                 "Created:",
@@ -84,101 +101,217 @@ wss.on("connection", (socket) => {
                 lobby.map
             );
 
-            socket.send(JSON.stringify({
+            sendTo(socket, {
                 type: "lobby_created",
-                lobby: lobby,
+                lobby: {
+                    id: lobby.id,
+                    name: lobby.name,
+                    map: lobby.map,
+                    players: 1,
+                    max_players: lobby.max_players
+                },
                 host: true
-            }));
+            });
 
-            sendLobbyList();
+            broadcastLobbyList();
         }
 
-        if (message.type === "set_room_id") {
+        else if (message.type === "join_lobby") {
             const lobbyId = Number(message.lobby_id);
-            const roomId = String(message.room_id);
-
             const lobby = lobbies.get(lobbyId);
 
             if (!lobby) {
-                socket.send(JSON.stringify({
+                sendTo(socket, {
                     type: "error",
                     message: "Lobby does not exist."
-                }));
-
+                });
                 return;
             }
 
-            lobby.room_id = roomId;
-
-            console.log(
-                "NodeTunnel room assigned:",
-                lobby.name,
-                "|",
-                roomId
-            );
-
-            sendLobbyList();
-        }
-
-        if (message.type === "join_lobby") {
-            const lobbyId = Number(message.lobby_id);
-
-            const lobby = lobbies.get(lobbyId);
-
-            if (!lobby) {
-                socket.send(JSON.stringify({
-                    type: "error",
-                    message: "Lobby does not exist."
-                }));
-
-                return;
-            }
-
-            if (lobby.players >= lobby.max_players) {
-                socket.send(JSON.stringify({
+            if (lobby.players.size >= lobby.max_players) {
+                sendTo(socket, {
                     type: "error",
                     message: "Lobby is full."
-                }));
-
+                });
                 return;
             }
 
-            if (!lobby.room_id) {
-                socket.send(JSON.stringify({
-                    type: "error",
-                    message: "Game room is not ready yet."
-                }));
+            socket.lobbyId = lobbyId;
 
-                return;
-            }
-
-            lobby.players += 1;
+            lobby.players.set(socket, true);
 
             console.log(
-                "Player joined:",
-                lobby.name,
-                "| NodeTunnel room:",
-                lobby.room_id
+                "Lobby joined:",
+                lobby.name
             );
 
-            socket.send(JSON.stringify({
+            sendTo(socket, {
                 type: "lobby_joined",
-                lobby: lobby,
+                lobby: {
+                    id: lobby.id,
+                    name: lobby.name,
+                    map: lobby.map,
+                    players: lobby.players.size,
+                    max_players: lobby.max_players
+                },
                 host: false
-            }));
+            });
 
-            sendLobbyList();
+            broadcastLobbyList();
+        }
+
+        else if (message.type === "game_join") {
+            const lobbyId = Number(message.lobby_id);
+            const lobby = lobbies.get(lobbyId);
+
+            if (!lobby) {
+                sendTo(socket, {
+                    type: "error",
+                    message: "Lobby does not exist."
+                });
+                return;
+            }
+
+            const playerId = nextPlayerId++;
+
+            socket.lobbyId = lobbyId;
+            socket.playerId = playerId;
+
+            lobby.players.set(socket, true);
+
+            lobby.gamePlayers.set(playerId, {
+                socket: socket,
+                x: 0,
+                y: 0,
+                animation: "idle_down"
+            });
+
+            const existingPlayers = [];
+
+            for (const [id, player] of lobby.gamePlayers) {
+                if (id === playerId) {
+                    continue;
+                }
+
+                existingPlayers.push({
+                    id: id,
+                    x: player.x,
+                    y: player.y,
+                    animation: player.animation
+                });
+            }
+
+            sendTo(socket, {
+                type: "game_joined",
+                player_id: playerId,
+                map: lobby.map,
+                players: existingPlayers
+            });
+
+            broadcastToGame(
+                lobby,
+                {
+                    type: "player_joined",
+                    id: playerId,
+                    x: 0,
+                    y: 0,
+                    animation: "idle_down"
+                },
+                socket
+            );
+
+            console.log(
+                "Player",
+                playerId,
+                "joined game",
+                lobby.name
+            );
+
+            broadcastLobbyList();
+        }
+
+        else if (message.type === "player_update") {
+            const lobbyId = socket.lobbyId;
+            const playerId = socket.playerId;
+
+            if (!lobbyId || !playerId) {
+                return;
+            }
+
+            const lobby = lobbies.get(lobbyId);
+
+            if (!lobby) {
+                return;
+            }
+
+            const player = lobby.gamePlayers.get(playerId);
+
+            if (!player) {
+                return;
+            }
+
+            player.x = Number(message.x);
+            player.y = Number(message.y);
+            player.animation = String(message.animation);
+
+            broadcastToGame(
+                lobby,
+                {
+                    type: "player_update",
+                    id: playerId,
+                    x: player.x,
+                    y: player.y,
+                    animation: player.animation
+                },
+                socket
+            );
         }
     });
 
     socket.on("close", () => {
-        console.log("Player disconnected");
+        console.log("Client disconnected");
+
+        const lobbyId = socket.lobbyId;
+
+        if (!lobbyId) {
+            return;
+        }
+
+        const lobby = lobbies.get(lobbyId);
+
+        if (!lobby) {
+            return;
+        }
+
+        const playerId = socket.playerId;
+
+        if (playerId && lobby.gamePlayers.has(playerId)) {
+            lobby.gamePlayers.delete(playerId);
+
+            broadcastToGame(lobby, {
+                type: "player_left",
+                id: playerId
+            });
+        }
+
+        lobby.players.delete(socket);
+
+        if (lobby.players.size === 0) {
+            lobbies.delete(lobbyId);
+
+            console.log(
+                "Deleted empty lobby:",
+                lobby.name
+            );
+        }
+
+        broadcastLobbyList();
     });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
     console.log("================================");
-    console.log("Lobby server started!");
-    console.log("Lobby port:", PORT);
+    console.log("Multiplayer server started!");
+    console.log("Port:", PORT);
     console.log("================================");
 });
