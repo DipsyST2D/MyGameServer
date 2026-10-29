@@ -1,3 +1,4 @@
+
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -7,311 +8,306 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 3000;
+const MAX_PLAYERS = 8;
 
 const lobbies = new Map();
 
 let nextLobbyId = 1;
 let nextPlayerId = 1;
 
-app.get("/", (req, res) => {
-    res.send("Multiplayer server is running!");
+app.get("/", (_req, res) => {
+	res.send("Multiplayer server is running!");
 });
 
 function sendTo(socket, data) {
-    if (socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify(data));
-    }
+	if (socket.readyState === WebSocket.OPEN) {
+		socket.send(JSON.stringify(data));
+	}
 }
 
 function broadcastLobbyList() {
-    const lobbiesArray = [];
+	const lobbyList = [];
 
-    for (const lobby of lobbies.values()) {
-        lobbiesArray.push({
-            id: lobby.id,
-            name: lobby.name,
-            map: lobby.map,
-            players: lobby.players.size,
-            max_players: lobby.max_players
-        });
-    }
+	for (const lobby of lobbies.values()) {
+		lobbyList.push({
+			id: lobby.id,
+			name: lobby.name,
+			map: lobby.map,
+			players: lobby.players.size,
+			max_players: lobby.max_players
+		});
+	}
 
-    const message = {
-        type: "lobby_list",
-        lobbies: lobbiesArray
-    };
+	const message = {
+		type: "lobby_list",
+		lobbies: lobbyList
+	};
 
-    for (const client of wss.clients) {
-        sendTo(client, message);
-    }
+	for (const client of wss.clients) {
+		sendTo(client, message);
+	}
 }
 
 function broadcastToGame(lobby, data, exceptSocket = null) {
-    for (const player of lobby.gamePlayers.values()) {
-        if (player.socket !== exceptSocket) {
-            sendTo(player.socket, data);
-        }
-    }
+	for (const player of lobby.gamePlayers.values()) {
+		if (player.socket !== exceptSocket) {
+			sendTo(player.socket, data);
+		}
+	}
+}
+
+function removeFromLobby(socket) {
+	const lobbyId = socket.lobbyId;
+
+	if (lobbyId === null || lobbyId === undefined) {
+		return;
+	}
+
+	const lobby = lobbies.get(lobbyId);
+
+	socket.lobbyId = null;
+	socket.playerId = null;
+
+	if (!lobby) {
+		return;
+	}
+
+	const playerId = [...lobby.gamePlayers.entries()].find(
+		([_id, player]) => player.socket === socket
+	)?.[0];
+
+	if (playerId !== undefined) {
+		lobby.gamePlayers.delete(playerId);
+
+		broadcastToGame(lobby, {
+			type: "player_left",
+			id: playerId
+		});
+	}
+
+	lobby.players.delete(socket);
+
+	if (lobby.players.size === 0) {
+		lobbies.delete(lobbyId);
+		console.log("Deleted empty lobby:", lobby.name);
+	}
+
+	broadcastLobbyList();
+}
+
+function makeLobbyInfo(lobby) {
+	return {
+		id: lobby.id,
+		name: lobby.name,
+		map: lobby.map,
+		players: lobby.players.size,
+		max_players: lobby.max_players
+	};
 }
 
 wss.on("connection", (socket) => {
-    console.log("Client connected");
+	console.log("Client connected");
 
-    socket.lobbyId = null;
-    socket.playerId = null;
+	socket.lobbyId = null;
+	socket.playerId = null;
 
-    sendTo(socket, {
-        type: "connected"
-    });
+	sendTo(socket, { type: "connected" });
+	broadcastLobbyList();
 
-    broadcastLobbyList();
+	socket.on("message", (rawData) => {
+		let message;
 
-    socket.on("message", (data) => {
-        let message;
+		try {
+			message = JSON.parse(rawData.toString());
+		} catch {
+			return;
+		}
 
-        try {
-            message = JSON.parse(data.toString());
-        } catch {
-            console.log("Invalid JSON received");
-            return;
-        }
+		if (!message || typeof message.type !== "string") {
+			return;
+		}
 
-        if (message.type === "create_lobby") {
-            const lobbyId = nextLobbyId++;
+		if (message.type === "create_lobby") {
+			const map = String(message.map || "Forest");
 
-            const lobby = {
-                id: lobbyId,
-                name: "Room " + lobbyId,
-                map: String(message.map),
-                max_players: 8,
-                players: new Map(),
-                gamePlayers: new Map()
-            };
+			removeFromLobby(socket);
 
-            lobbies.set(lobbyId, lobby);
+			const lobbyId = nextLobbyId++;
+			const lobby = {
+				id: lobbyId,
+				name: "Room " + lobbyId,
+				map,
+				max_players: MAX_PLAYERS,
+				players: new Map(),
+				gamePlayers: new Map()
+			};
 
-            socket.lobbyId = lobbyId;
+			lobbies.set(lobbyId, lobby);
+			lobby.players.set(socket, true);
+			socket.lobbyId = lobbyId;
 
-            lobby.players.set(socket, true);
+			sendTo(socket, {
+				type: "lobby_created",
+				lobby: makeLobbyInfo(lobby),
+				host: true
+			});
 
-            console.log(
-                "Created:",
-                lobby.name,
-                "|",
-                lobby.map
-            );
+			broadcastLobbyList();
+			console.log("Created:", lobby.name, "|", lobby.map);
+			return;
+		}
 
-            sendTo(socket, {
-                type: "lobby_created",
-                lobby: {
-                    id: lobby.id,
-                    name: lobby.name,
-                    map: lobby.map,
-                    players: 1,
-                    max_players: lobby.max_players
-                },
-                host: true
-            });
+		if (message.type === "join_lobby") {
+			const lobby = lobbies.get(Number(message.lobby_id));
 
-            broadcastLobbyList();
-        }
+			if (!lobby) {
+				sendTo(socket, {
+					type: "error",
+					message: "Lobby does not exist."
+				});
+				return;
+			}
 
-        else if (message.type === "join_lobby") {
-            const lobbyId = Number(message.lobby_id);
-            const lobby = lobbies.get(lobbyId);
+			if (socket.lobbyId === lobby.id && lobby.players.has(socket)) {
+				sendTo(socket, {
+					type: "lobby_joined",
+					lobby: makeLobbyInfo(lobby),
+					host: false
+				});
+				return;
+			}
 
-            if (!lobby) {
-                sendTo(socket, {
-                    type: "error",
-                    message: "Lobby does not exist."
-                });
-                return;
-            }
+			if (lobby.players.size >= lobby.max_players) {
+				sendTo(socket, {
+					type: "error",
+					message: "Lobby is full."
+				});
+				return;
+			}
 
-            if (lobby.players.size >= lobby.max_players) {
-                sendTo(socket, {
-                    type: "error",
-                    message: "Lobby is full."
-                });
-                return;
-            }
+			removeFromLobby(socket);
 
-            socket.lobbyId = lobbyId;
+			lobby.players.set(socket, true);
+			socket.lobbyId = lobby.id;
 
-            lobby.players.set(socket, true);
+			sendTo(socket, {
+				type: "lobby_joined",
+				lobby: makeLobbyInfo(lobby),
+				host: false
+			});
 
-            console.log(
-                "Lobby joined:",
-                lobby.name
-            );
+			broadcastLobbyList();
+			console.log("Lobby joined:", lobby.name);
+			return;
+		}
 
-            sendTo(socket, {
-                type: "lobby_joined",
-                lobby: {
-                    id: lobby.id,
-                    name: lobby.name,
-                    map: lobby.map,
-                    players: lobby.players.size,
-                    max_players: lobby.max_players
-                },
-                host: false
-            });
+		if (message.type === "game_join") {
+			const lobbyId = Number(message.lobby_id);
+			const lobby = lobbies.get(lobbyId);
 
-            broadcastLobbyList();
-        }
+			if (!lobby || socket.lobbyId !== lobbyId || !lobby.players.has(socket)) {
+				sendTo(socket, {
+					type: "error",
+					message: "Join the lobby before entering the game."
+				});
+				return;
+			}
 
-        else if (message.type === "game_join") {
-            const lobbyId = Number(message.lobby_id);
-            const lobby = lobbies.get(lobbyId);
+			let playerId = socket.playerId;
 
-            if (!lobby) {
-                sendTo(socket, {
-                    type: "error",
-                    message: "Lobby does not exist."
-                });
-                return;
-            }
+			if (!playerId || !lobby.gamePlayers.has(playerId)) {
+				playerId = nextPlayerId++;
+				socket.playerId = playerId;
 
-            const playerId = nextPlayerId++;
+				lobby.gamePlayers.set(playerId, {
+					socket,
+					x: 0,
+					y: 0,
+					animation: "idle_down"
+				});
 
-            socket.lobbyId = lobbyId;
-            socket.playerId = playerId;
+				broadcastToGame(lobby, {
+					type: "player_joined",
+					id: playerId,
+					x: 0,
+					y: 0,
+					animation: "idle_down"
+				}, socket);
 
-            lobby.players.set(socket, true);
+				console.log("Player", playerId, "joined", lobby.name);
+			}
 
-            lobby.gamePlayers.set(playerId, {
-                socket: socket,
-                x: 0,
-                y: 0,
-                animation: "idle_down"
-            });
+			const existingPlayers = [];
 
-            const existingPlayers = [];
+			for (const [id, player] of lobby.gamePlayers) {
+				if (id === playerId) {
+					continue;
+				}
 
-            for (const [id, player] of lobby.gamePlayers) {
-                if (id === playerId) {
-                    continue;
-                }
+				existingPlayers.push({
+					id,
+					x: player.x,
+					y: player.y,
+					animation: player.animation
+				});
+			}
 
-                existingPlayers.push({
-                    id: id,
-                    x: player.x,
-                    y: player.y,
-                    animation: player.animation
-                });
-            }
+			sendTo(socket, {
+				type: "game_joined",
+				player_id: playerId,
+				map: lobby.map,
+				players: existingPlayers
+			});
 
-            sendTo(socket, {
-                type: "game_joined",
-                player_id: playerId,
-                map: lobby.map,
-                players: existingPlayers
-            });
+			broadcastLobbyList();
+			return;
+		}
 
-            broadcastToGame(
-                lobby,
-                {
-                    type: "player_joined",
-                    id: playerId,
-                    x: 0,
-                    y: 0,
-                    animation: "idle_down"
-                },
-                socket
-            );
+		if (message.type === "player_update") {
+			const lobby = lobbies.get(socket.lobbyId);
+			const playerId = socket.playerId;
 
-            console.log(
-                "Player",
-                playerId,
-                "joined game",
-                lobby.name
-            );
+			if (!lobby || !playerId) {
+				return;
+			}
 
-            broadcastLobbyList();
-        }
+			const player = lobby.gamePlayers.get(playerId);
 
-        else if (message.type === "player_update") {
-            const lobbyId = socket.lobbyId;
-            const playerId = socket.playerId;
+			if (!player) {
+				return;
+			}
 
-            if (!lobbyId || !playerId) {
-                return;
-            }
+			const x = Number(message.x);
+			const y = Number(message.y);
 
-            const lobby = lobbies.get(lobbyId);
+			if (!Number.isFinite(x) || !Number.isFinite(y)) {
+				return;
+			}
 
-            if (!lobby) {
-                return;
-            }
+			player.x = x;
+			player.y = y;
+			player.animation = String(message.animation || "idle_down");
 
-            const player = lobby.gamePlayers.get(playerId);
+			broadcastToGame(lobby, {
+				type: "player_update",
+				id: playerId,
+				x: player.x,
+				y: player.y,
+				animation: player.animation
+			}, socket);
+		}
+	});
 
-            if (!player) {
-                return;
-            }
+	socket.on("close", () => {
+		console.log("Client disconnected");
+		removeFromLobby(socket);
+	});
 
-            player.x = Number(message.x);
-            player.y = Number(message.y);
-            player.animation = String(message.animation);
-
-            broadcastToGame(
-                lobby,
-                {
-                    type: "player_update",
-                    id: playerId,
-                    x: player.x,
-                    y: player.y,
-                    animation: player.animation
-                },
-                socket
-            );
-        }
-    });
-
-    socket.on("close", () => {
-        console.log("Client disconnected");
-
-        const lobbyId = socket.lobbyId;
-
-        if (!lobbyId) {
-            return;
-        }
-
-        const lobby = lobbies.get(lobbyId);
-
-        if (!lobby) {
-            return;
-        }
-
-        const playerId = socket.playerId;
-
-        if (playerId && lobby.gamePlayers.has(playerId)) {
-            lobby.gamePlayers.delete(playerId);
-
-            broadcastToGame(lobby, {
-                type: "player_left",
-                id: playerId
-            });
-        }
-
-        lobby.players.delete(socket);
-
-        if (lobby.players.size === 0) {
-            lobbies.delete(lobbyId);
-
-            console.log(
-                "Deleted empty lobby:",
-                lobby.name
-            );
-        }
-
-        broadcastLobbyList();
-    });
+	socket.on("error", (error) => {
+		console.error("WebSocket error:", error.message);
+	});
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-    console.log("================================");
-    console.log("Multiplayer server started!");
-    console.log("Port:", PORT);
-    console.log("================================");
+	console.log("Multiplayer server started on port", PORT);
 });
